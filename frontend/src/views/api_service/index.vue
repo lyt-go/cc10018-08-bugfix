@@ -162,6 +162,11 @@ async function runAction(action: string, row: Row) {
     if (!response.ok) {
       throw new Error('API服务动作未生效，请稍后重试')
     }
+    const payload = await response.json()
+    if (!payload.ok) {
+      // 契约校验失败时后端返回 200 + ok:false，message 中带冲突字段，需直接展示。
+      throw new Error(payload.message || 'API服务动作未生效')
+    }
     await reload()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : 'API服务操作失败'

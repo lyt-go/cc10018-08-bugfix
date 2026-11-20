@@ -85,23 +85,43 @@ def create_entry(payload: dict[str, object]) -> ActionResult:
 
 @router.post("/{entry_id}/actions", response_model=ActionResult)
 def run_action(entry_id: int, payload: ActionPayload) -> ActionResult:
-    """对单条数据接口执行提交校验、发布接口、下线接口；不允许的动作会被拦下并说明原因。"""
-    entry, message = service.run_action(entry_id, payload.action.strip())
+    """对单条数据接口执行提交校验、发布接口、下线接口。
+
+    提交校验与发布接口都会核对接口声明字段与所选模板（参数名、类型、可绑定返回列）；
+    校验失败时拦截动作、保留原状态，并在 message 中指出冲突字段。
+    """
+    entry, message, validation = service.run_action(entry_id, payload.action.strip())
     if entry is None:
-        return ActionResult(ok=False, message=message)
+        return ActionResult(ok=False, message=message, entry=None)
     return ActionResult(ok=True, message=message, entry=entry)
+
+
+@router.get("/{entry_id}/binding-validation")
+def get_binding_validation(entry_id: int) -> dict:
+    """返回接口绑定校验结果；尚未校验时现场按当前模板核对一次但不落状态。"""
+    entry = service.get_entry(entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"数据接口 {entry_id} 不存在或已归档")
+    stored = service.check_binding(entry_id)
+    if stored is not None:
+        return stored
+    _, validation = service.validate_contract(entry_id)
+    return validation or {"ok": False, "errors": ["校验结果不可用"], "conflicts": []}
 
 
 @router.post("/{entry_id}/bind-sql")
 def bind_sql(entry_id: int, payload: dict[str, object]) -> dict:
-    """对API接口的SQL模板进行参数绑定（API服务→SQL模板链）。"""
+    """对API接口执行参数绑定（API服务→SQL模板链）。
+
+    绑定消费发布时固化的接口绑定校验结果：模板指纹漂移、必填参数缺失、
+    契约外实参都会在取数前被拒绝，绑定SQL取自发布时核对过的快照。
+    """
     from app.engine.sql_binder import SqlTemplateBinder
     binder = SqlTemplateBinder()
     entry = service.get_entry(entry_id)
     if not entry:
         raise HTTPException(status_code=404, detail=f"接口 {entry_id} 不存在")
-    result = binder.expand_api_query(entry_id, payload)
-    return result
+    return binder.expand_api_query(entry_id, payload)
 
 
 @router.get("/{entry_id}/optimize")

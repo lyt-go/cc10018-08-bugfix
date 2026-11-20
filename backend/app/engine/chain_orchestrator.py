@@ -98,7 +98,12 @@ class ChainOrchestrator:
     # 链路 2: 查询服务链
     # ───────────────────────────────────────────────
     def run_query_service_chain(self, api_id: int, template_id: int, params: dict[str, Any]) -> dict[str, Any]:
-        """查询服务链：API服务→SQL模板→查询优化→数据预览。"""
+        """查询服务链：API服务→SQL模板→查询优化→数据预览。
+
+        绑定环节消费接口绑定校验结果，用契约一致的查询字段与实参条件生成绑定：
+        传入的 template_id 必须就是接口发布时核对的模板，模板指纹漂移、
+        必填参数缺失或契约外实参都会在取数前拦截。
+        """
         result = {"chain": "query_service", "steps": [], "ok": True}
 
         # Step 1: API服务
@@ -108,17 +113,53 @@ class ChainOrchestrator:
             result["steps"].append({"step": 1, "module": "api_service", "status": "error", "detail": f"接口 {api_id} 不存在"})
             return result
         if api.get("status") != "已发布":
-            result["steps"].append({"step": 1, "module": "api_service", "status": "warning", "detail": f"接口状态为 {api.get('status')}"})
-        else:
-            result["steps"].append({"step": 1, "module": "api_service", "status": "ok", "detail": f"接口 {api.get('接口编号')} 已发布"})
+            result["ok"] = False
+            result["steps"].append({"step": 1, "module": "api_service", "status": "error", "detail": f"接口状态为 {api.get('status')}，未发布不能取数"})
+            return result
+        result["steps"].append({"step": 1, "module": "api_service", "status": "ok", "detail": f"接口 {api.get('接口编号')} 已发布"})
 
-        # Step 2: SQL模板绑定
-        bind_result = self.binder.expand_template(template_id, params)
+        # Step 2: SQL模板绑定（消费接口绑定校验结果，不直接对任意模板展开）
+        requested_template = store.find("sql_template", template_id)
+        if not requested_template:
+            result["ok"] = False
+            result["steps"].append({"step": 2, "module": "sql_template", "status": "error", "detail": f"模板 {template_id} 不存在"})
+            return result
+
+        bind_result = self.binder.expand_api_query(api_id, params)
         if not bind_result.get("ok"):
             result["ok"] = False
-            result["steps"].append({"step": 2, "module": "sql_template", "status": "error", "detail": "; ".join(bind_result.get("errors", []))})
+            result["steps"].append({
+                "step": 2,
+                "module": "sql_template",
+                "status": "error",
+                "detail": "; ".join(bind_result.get("errors", [])),
+                "conflicts": bind_result.get("conflicts", []),
+            })
             return result
-        result["steps"].append({"step": 2, "module": "sql_template", "status": "ok", "detail": "SQL绑定成功", "bound_sql": bind_result["sql"]})
+
+        validation = bind_result.get("binding_validation", {})
+        if requested_template.get("模板编号") != validation.get("template_id"):
+            result["ok"] = False
+            result["steps"].append({
+                "step": 2,
+                "module": "sql_template",
+                "status": "error",
+                "detail": (
+                    f"请求模板 {requested_template.get('模板编号')} 与接口发布时核对的模板 "
+                    f"{validation.get('template_id')} 不一致，已拒绝绑定"
+                ),
+            })
+            return result
+
+        result["steps"].append({
+            "step": 2,
+            "module": "sql_template",
+            "status": "ok",
+            "detail": "SQL绑定成功（已通过接口绑定校验）",
+            "bound_sql": bind_result["sql"],
+            "bound_params": bind_result.get("params", []),
+            "template_fingerprint": validation.get("template_fingerprint"),
+        })
 
         # Step 3: 查询优化
         opt_report = self.optimizer.analyze_sql(bind_result["sql"], api_id=api_id)
@@ -132,6 +173,7 @@ class ChainOrchestrator:
             result["steps"].append({"step": 4, "module": "data_preview", "status": "warning", "detail": "未找到关联的预览模板"})
 
         result["bound_sql"] = bind_result["sql"]
+        result["binding_validation"] = validation
         result["optimization"] = opt_report
         return result
 
